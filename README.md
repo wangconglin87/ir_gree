@@ -19,7 +19,7 @@
 
 结束码：660us低电平
 
-![demo](res/114318.png)
+![demo](res/205907.png)
 
 
 ## 使用ESP32 IDF RMT实现红外发射
