@@ -1,1 +1,5 @@
-/esp32/.vscode
+.vscode
+
+esp32/build
+esp32/.vscode
+esp32/sdkconfig*

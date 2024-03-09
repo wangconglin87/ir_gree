@@ -11,9 +11,28 @@
  */
 
 #include <stdint.h>
-#include "driver/rmt_tx.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_log.h"
 #include "esp_check.h"
+#include "esp_system.h"
+#include "esp_sleep.h"
+
+#include "lwip/err.h"
+#include "lwip/sys.h"
+
+#include "driver/rmt_types.h"
+#include "driver/rmt_tx.h"
+#include "driver/rmt_encoder.h"
+
+#include "mqtt_client.h"
 
 #define IR_RESOLUTION_HZ 1000000 // 1MHz resolution, 1 tick = 1us
 #define IR_TX_GPIO_NUM 18
@@ -45,13 +64,6 @@
 
 // 一共4段数据码，第一段和第三段都是35位，其中后7位是固定的，
 // 又因为乐鑫RMT驱动只能按字节编码，故后三位在编码阶段使用硬编码
-static uint32_t data1 = 0;
-static uint32_t data2 = 0;
-static uint32_t data3 = 0;
-static uint32_t data4 = 0;
-
-static const char *TAG = "My RMT";
-
 typedef struct
 {
     uint32_t data1;
@@ -82,6 +94,11 @@ typedef struct
     rmt_encoder_t *bytes_encoder;
     int state;
 } rmt_ir_gree_encoder_t;
+
+static const char *TAG = "My RMT";
+static int s_retry_num = 0;
+static rmt_channel_handle_t tx_channel = NULL;
+static rmt_encoder_handle_t gree_encoder = NULL;
 
 static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
                                  rmt_channel_handle_t channel,
@@ -114,6 +131,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 编码数据段1，调用bytes_encoder
     case 1:
@@ -127,6 +145,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 补充数据段1的后三位，调用copy_encoder,这个是数组，大小要乘以3
     case 2:
@@ -143,6 +162,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 短连接码
     case 3:
@@ -159,6 +179,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 编码数据段2，调用bytes_encoder
     case 4:
@@ -172,6 +193,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 长连接码, 数组 2倍大小
     case 5:
@@ -188,6 +210,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 引导码，注意数据段3和4，不是1和2的重复，有不同内容
     case 6:
@@ -204,6 +227,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 编码数据段3，调用bytes_encoder
     case 7:
@@ -217,6 +241,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 补充数据段3的后三位，调用copy_encoder,这个是数组，大小要乘以3
     case 8:
@@ -233,6 +258,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 短连接码
     case 9:
@@ -249,6 +275,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 编码数据段4，调用bytes_encoder
     case 10:
@@ -262,7 +289,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
             state |= RMT_ENCODING_MEM_FULL;
             goto out;
         }
-
+        [[fallthrough]];
     // fall-through 注意这里没break
     // 结束码
     case 11:
@@ -271,7 +298,7 @@ static size_t rmt_encode_ir_gree(rmt_encoder_t *encoder,
                                                 sizeof(rmt_symbol_word_t),
                                                 &session_state);
         if (session_state & RMT_ENCODING_COMPLETE)
-        {   // 这里跟前面的都不一样了
+        { // 这里跟前面的都不一样了
             gree_encoder->state = RMT_ENCODING_RESET;
             state |= RMT_ENCODING_COMPLETE;
         }
@@ -390,15 +417,12 @@ esp_err_t rmt_new_ir_gree_encoder(const ir_gree_encoder_config_t *config, rmt_en
     ESP_GOTO_ON_ERROR(rmt_new_bytes_encoder(&bytes_encoder_config, &gree_encoder->bytes_encoder), err, TAG, "create bytes encoder failed");
 
     *ret_encoder = &gree_encoder->base;
-
     return ret;
-
 err:
-
     return ret;
 }
 
-void app_main(void)
+void init_ir(void)
 {
     rmt_tx_channel_config_t tx_channel_cfg = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
@@ -407,7 +431,6 @@ void app_main(void)
         .trans_queue_depth = 4,
         .gpio_num = IR_TX_GPIO_NUM,
     };
-    rmt_channel_handle_t tx_channel = NULL;
     ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_channel_cfg, &tx_channel));
 
     rmt_carrier_config_t carrier_cfg = {
@@ -416,28 +439,191 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(rmt_apply_carrier(tx_channel, &carrier_cfg));
 
-    rmt_transmit_config_t transmit_config = {
-        .loop_count = 0, // no loop
-    };
-
     ir_gree_encoder_config_t encoder_cfg = {
         .resolution = IR_RESOLUTION_HZ,
     };
-    rmt_encoder_handle_t gree_encoder = NULL;
+
     ESP_ERROR_CHECK(rmt_new_ir_gree_encoder(&encoder_cfg, &gree_encoder));
 
     ESP_ERROR_CHECK(rmt_enable(tx_channel));
+}
 
-    while (1)
+static void rmt_start()
+{
+    rmt_transmit_config_t transmit_config = {
+        .loop_count = 0,
+    };
+    const ir_gree_scan_code_t scan_code = {
+        .data1 = 0xaaaaaaaa,
+        .data2 = 0xaaaaaaaa,
+        .data3 = 0xaaaaaaaa,
+        .data4 = 0xaaaaaaaa,
+    };
+    ESP_ERROR_CHECK(rmt_transmit(tx_channel, gree_encoder, &scan_code, sizeof(scan_code), &transmit_config));
+}
+
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+    if (error_code != 0)
     {
-        // 阻塞5s
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        const ir_gree_scan_code_t scan_code = {
-            .data1 = 0xaaaaaaaa,
-            .data2 = 0xaaaaaaaa,
-            .data3 = 0xaaaaaaaa,
-            .data4 = 0xaaaaaaaa,
-        };
-        ESP_ERROR_CHECK(rmt_transmit(tx_channel, gree_encoder, &scan_code, sizeof(scan_code), &transmit_config));
+        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
     }
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
+    esp_mqtt_event_handle_t event = event_data;
+    esp_mqtt_client_handle_t client = event->client;
+    int msg_id;
+    switch ((esp_mqtt_event_id_t)event_id)
+    {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        msg_id = esp_mqtt_client_publish(client, "topic/test", "data_3", 0, 1, 0);
+        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+
+        msg_id = esp_mqtt_client_subscribe(client, "topic/qos0", 0);
+        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+        msg_id = esp_mqtt_client_subscribe(client, "topic/qos1", 1);
+        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+        msg_id = esp_mqtt_client_subscribe(client, "topic/test", 1);
+        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+        msg_id = esp_mqtt_client_publish(client, "topic/qos0", "data", 0, 0, 0);
+        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+        break;
+    case MQTT_EVENT_UNSUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_PUBLISHED:
+        ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+        printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        printf("DATA=%.*s\r\n", event->data_len, event->data);
+        rmt_start();
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT)
+        {
+            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
+            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
+            log_error_if_nonzero("captured as transport's socket errno", event->error_handle->esp_transport_sock_errno);
+            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+        }
+        break;
+    default:
+        ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+        break;
+    }
+}
+
+static void mqtt_app_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://192.168.50.229",
+    };
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    ESP_ERROR_CHECK(esp_mqtt_client_start(client));
+}
+
+static void event_handler(void *event_handler_arg,
+                          esp_event_base_t event_base,
+                          int32_t event_id,
+                          void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        if (s_retry_num < 10)
+        {
+            ESP_ERROR_CHECK(esp_wifi_connect());
+            s_retry_num++;
+            ESP_LOGI(TAG, "retry to connect to the AP");
+        }
+        else
+        {
+            ESP_LOGI(TAG, "connect to the AP fail");
+            // ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(60*1000*1000));
+            esp_deep_sleep(60 * 1000 * 1000);
+            s_retry_num = 0;
+            ESP_ERROR_CHECK(esp_wifi_connect());
+        }
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+
+        mqtt_app_start();
+    }
+}
+
+void app_main(void)
+{
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    assert(sta_netif);
+    wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,
+                                               ESP_EVENT_ANY_ID,
+                                               &event_handler,
+                                               NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,
+                                               ESP_EVENT_ANY_ID,
+                                               &event_handler,
+                                               NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "",
+            .password = "",
+        }};
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    init_ir();
+    // while (1)
+    // {
+    //     // 阻塞5s
+    //     vTaskDelay(1000 / portTICK_PERIOD_MS);
+    //     const ir_gree_scan_code_t scan_code = {
+    //         .data1 = 0xaaaaaaaa,
+    //         .data2 = 0xaaaaaaaa,
+    //         .data3 = 0xaaaaaaaa,
+    //         .data4 = 0xaaaaaaaa,
+    //     };
+    //     ESP_ERROR_CHECK(rmt_transmit(tx_channel, gree_encoder, &scan_code, sizeof(scan_code), &transmit_config));
+    // }
 }
