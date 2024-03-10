@@ -1,4 +1,5 @@
 .vscode
+/build
 
 esp32/build
 esp32/.vscode
